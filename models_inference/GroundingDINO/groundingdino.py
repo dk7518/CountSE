@@ -67,6 +67,21 @@ from matplotlib.patches import Rectangle
 from groundingdino.util.visualizer import renorm
 
 
+class ExemplarAdapter(nn.Module):
+    def __init__(self, dim=256, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, dim),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        return x + self.net(x)
+
+
 class ExemplarSelector(nn.Module):
     def __init__(self, max_added_num=8, egv=0.1, topk_num=20):
         super().__init__()
@@ -75,64 +90,38 @@ class ExemplarSelector(nn.Module):
         self.cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
         self.egv = egv
         self.topk = topk_num
+        self.adapter = ExemplarAdapter(dim=256, hidden_dim=256)
 
     def eigenDecomposition(self, A):
-        """
-        References:
-        https://papers.nips.cc/paper/2619-self-tuning-spectral-clustering.pdf
-        http://www.kyb.mpg.de/fileadmin/user_upload/files/publications/attachments/Luxburg07_tutorial_4488%5b0%5d.pdf
-        """
         threshold = self.egv
         clusters = []
         for a in A:
             L = csgraph.laplacian(a, normed=True)
             eigenvalues, eigenvectors = LA.eig(L)
-
             diffs = np.diff(eigenvalues)
             index_largest_gap = np.argsort(diffs)[::-1][:5]
-
             n_clusters = []
-
             for i in index_largest_gap:
                 if diffs[i] > threshold:
                     n_clusters.append(i)
             nb_clusters = np.array(n_clusters) + 1
             clusters.append(nb_clusters[:2])
-
         return clusters
 
     def get_largest_cluster_indices(self, labels):
-        """
-        Get the index of the largest number of clusters in each batch
-
-        Args:
-        - labels: List of labels with shape [batch_size, length].
-
-        Returns:
-        - selected_indices: A list of indices of the largest clusters for each batch.
-        """
         selected_indices = []
-
         for label_list in labels:
-            # Calculate the frequency of each label
             label_counts = Counter(label_list)
-
-            # Find the most frequent label
             most_common_label, _ = label_counts.most_common(1)[0]
-
-            # Get all indexes of the cluster
             largest_cluster_indices = [i for i, label in enumerate(label_list) if label == most_common_label]
             selected_indices.append(largest_cluster_indices)
-
         return selected_indices
 
     def batch_indexing_tensor(self, extra_small_indices, index_list):
         selected_elements = []
-
         for batch_indices, indices_to_select in zip(extra_small_indices, index_list):
             selected_elements_batch = batch_indices[indices_to_select]
             selected_elements.append(selected_elements_batch)
-
         return selected_elements
 
     def forward(self, srcs, label_dict):
@@ -140,12 +129,11 @@ class ExemplarSelector(nn.Module):
 
         def get_max_score_indice(src):
             bs, c, h, w = src.shape
-            src = src.reshape(bs, c, h*w).transpose(-1, -2)
-            embed_similarity_scores = self.enc_out_class_embed(src, label_dict).max(-1)[0]
-
+            src = src.reshape(bs, c, h * w).transpose(-1, -2)
+            adapted_src = self.adapter(src)
+            embed_similarity_scores = self.enc_out_class_embed(adapted_src, label_dict).max(-1)[0]
             max_scores, max_indices = torch.topk(embed_similarity_scores, self.topk, dim=1)
-
-            return src, max_scores[:, 0], max_indices
+            return adapted_src, max_scores[:, 0], max_indices
 
         src0, extra_small_scores, extra_small_indices = get_max_score_indice(srcs[0])
         src1, small_scores, small_indices = get_max_score_indice(srcs[1])
@@ -158,12 +146,10 @@ class ExemplarSelector(nn.Module):
                     torch.gather(src3, dim=1, index=large_indices.unsqueeze(-1).expand(-1, -1, 256))]
 
         clustered_indices = []
-
         for feature in features:
             feature = feature / feature.norm(p=2, dim=2, keepdim=True)
             similarity_matrix = torch.bmm(feature, feature.transpose(1, 2)).detach().cpu().numpy()
             similarity_matrix[similarity_matrix < 0] = 0
-
             clusters = self.eigenDecomposition(similarity_matrix)
             labels = []
             n_clusters = [max(k) for k in clusters]
@@ -179,24 +165,20 @@ class ExemplarSelector(nn.Module):
         medium_indices = self.batch_indexing_tensor(medium_indices, clustered_indices[2])
         large_indices = self.batch_indexing_tensor(large_indices, clustered_indices[3])
 
-        for bs_index, (extra_small_score, small_score, medium_score, large_score, extra_small_indice, small_indice, medium_indice, large_indice) \
-                in enumerate(zip(extra_small_scores, small_scores, medium_scores, large_scores, extra_small_indices, small_indices, medium_indices, large_indices)):
+        for bs_index, (extra_small_score, small_score, medium_score, large_score,
+                       extra_small_indice, small_indice, medium_indice, large_indice) \
+                in enumerate(zip(extra_small_scores, small_scores, medium_scores, large_scores,
+                                  extra_small_indices, small_indices, medium_indices, large_indices)):
             total_score = extra_small_score + small_score + medium_score + large_score
-            extra_small_num = int(max(self.max_added_num * extra_small_score / total_score , 1))
+            extra_small_num = int(max(self.max_added_num * extra_small_score / total_score, 1))
             small_num = int(max(self.max_added_num * small_score / total_score, 1))
             medium_num = int(max(self.max_added_num * medium_score / total_score, 1))
             large_num = int(max(self.max_added_num * large_score / total_score, 1))
-
             remaining_num = self.max_added_num - (extra_small_num + small_num + medium_num + large_num)
-
             scores = [extra_small_score, small_score, medium_score, large_score]
             nums = [extra_small_num, small_num, medium_num, large_num]
-
-            max_score_index = scores.index(max(scores))  # Find the index with the highest score
-
+            max_score_index = scores.index(max(scores))
             nums[max_score_index] += remaining_num
-
-            # update num
             extra_small_num, small_num, medium_num, large_num = nums
 
             extra_small_indice = extra_small_indice[:extra_small_num]
