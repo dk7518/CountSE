@@ -61,6 +61,24 @@ from .utils import MLP, ContrastiveEmbed, sigmoid_focal_loss
 from .matcher import build_matcher
 
 
+class ExemplarAdapter(nn.Module):
+    """
+    on Frozen Swin feature - lightweight training projection. Residual + zero-init.
+    """
+ 
+    def __init__(self, dim=256, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, dim),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+ 
+    def forward(self, x):
+        return x + self.net(x)
+    
 class ExemplarSelector(nn.Module):
     def __init__(self, max_added_num=8, egv=0.1, topk_num=20):
         super().__init__()
@@ -69,6 +87,7 @@ class ExemplarSelector(nn.Module):
         self.cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
         self.egv = egv
         self.topk = topk_num
+        self.adapter = ExemplarAdapter(dim=256, hidden_dim=256) # for adapting the exemplar features to the same space as the text embeddings
 
     def eigenDecomposition(self, A):
         """
@@ -119,6 +138,20 @@ class ExemplarSelector(nn.Module):
             selected_indices.append(largest_cluster_indices)
 
         return selected_indices
+    
+    def get_pos_neg_cluster_indices(self, labels):
+        """
+        Get the indices of the positive and negative clusters for each batch.
+        """
+        pos_indices, neg_indices = [], []
+        for label_list in labels:
+            label_counts = Counter(label_list)
+            most_common_label, _ = label_counts.most_common(1)[0]
+            pos = [i for i, l in enumerate(label_list) if l == most_common_label]
+            neg = [i for i, l in enumerate(label_list) if l != most_common_label]
+            pos_indices.append(pos)
+            neg_indices.append(neg)
+        return pos_indices, neg_indices
 
     def batch_indexing_tensor(self, extra_small_indices, index_list):
         selected_elements = []
@@ -130,28 +163,40 @@ class ExemplarSelector(nn.Module):
         return selected_elements
 
     def forward(self, srcs, label_dict):
+        
         selected_exemplars_features = []
+        
+        # memory for negative feature list, negative coordinate list for each scale
+        neg_features_per_stage = []   # len 4, len bs list, [n_neg, 256]
+        neg_coords_per_stage = []
 
         def get_max_score_indice(src):
             bs, c, h, w = src.shape
             src = src.reshape(bs, c, h*w).transpose(-1, -2)
-            embed_similarity_scores = self.enc_out_class_embed(src, label_dict).max(-1)[0]
+            adapted_src = self.adapter(src) 
+            embed_similarity_scores = self.enc_out_class_embed(adapted_src, label_dict).max(-1)[0]
 
             max_scores, max_indices = torch.topk(embed_similarity_scores, self.topk, dim=1)
 
-            return src, max_scores[:, 0], max_indices
+            return adapted_src, max_scores[:, 0], max_indices, h, w 
 
-        src0, extra_small_scores, extra_small_indices = get_max_score_indice(srcs[0])
-        src1, small_scores, small_indices = get_max_score_indice(srcs[1])
-        src2, medium_scores, medium_indices = get_max_score_indice(srcs[2])
-        src3, large_scores, large_indices = get_max_score_indice(srcs[3])
+        src0, extra_small_scores, extra_small_indices, h0, w0 = get_max_score_indice(srcs[0])
+        src1, small_scores, small_indices, h1, w1 = get_max_score_indice(srcs[1])
+        src2, medium_scores, medium_indices, h2, w2 = get_max_score_indice(srcs[2])
+        src3, large_scores, large_indices, h3, w3 = get_max_score_indice(srcs[3])
+        
+        srcs_flat = [src0, src1, src2, src3]
+        hs = [h0, h1, h2, h3]
+        ws = [w0, w1, w2, w3]
+        all_indices = [extra_small_indices, small_indices, medium_indices, large_indices]
 
         features = [torch.gather(src0, dim=1, index=extra_small_indices.unsqueeze(-1).expand(-1, -1, 256)),
                     torch.gather(src1, dim=1, index=small_indices.unsqueeze(-1).expand(-1, -1, 256)),
                     torch.gather(src2, dim=1, index=medium_indices.unsqueeze(-1).expand(-1, -1, 256)),
                     torch.gather(src3, dim=1, index=large_indices.unsqueeze(-1).expand(-1, -1, 256))]
 
-        clustered_indices = []
+        clustered_pos_indices = []
+        clustered_neg_indices = []
 
         for feature in features:
             feature = feature / feature.norm(p=2, dim=2, keepdim=True)
@@ -165,16 +210,42 @@ class ExemplarSelector(nn.Module):
                 spectral = SpectralClustering(n_clusters=n_cluster, affinity='precomputed')
                 label = spectral.fit_predict(similarity)
                 labels.append(label)
+                
+            pos_labels, neg_labels = self.get_pos_neg_cluster_indices(labels)
             cluster_labels = self.get_largest_cluster_indices(labels)
-            clustered_indices.append(cluster_labels)
+            clustered_pos_indices.append(pos_labels)
+            clustered_neg_indices.append(neg_labels)
 
-        extra_small_indices = self.batch_indexing_tensor(extra_small_indices, clustered_indices[0])
-        small_indices = self.batch_indexing_tensor(small_indices, clustered_indices[1])
-        medium_indices = self.batch_indexing_tensor(medium_indices, clustered_indices[2])
-        large_indices = self.batch_indexing_tensor(large_indices, clustered_indices[3])
+        extra_small_indices_pos = self.batch_indexing_tensor(extra_small_indices, clustered_pos_indices[0])
+        small_indices_pos = self.batch_indexing_tensor(small_indices, clustered_pos_indices[1])
+        medium_indices_pos = self.batch_indexing_tensor(medium_indices, clustered_pos_indices[2])
+        large_indices_pos = self.batch_indexing_tensor(large_indices, clustered_pos_indices[3])
+        
+        for stage_i, (idx_tensor, neg_idx_list, h, w, src_feat) in enumerate(zip(all_indices, clustered_neg_indices, hs, ws, srcs_flat)):
+            neg_idx_per_batch = self.batch_indexing_tensor(idx_tensor, neg_idx_list)
+            stage_feats, stage_coords = [], []
+            for b_i, neg_flat_idx in enumerate(neg_idx_per_batch):
+                if neg_flat_idx.numel() == 0:
+                    stage_feats.append(src_feat.new_zeros((0, 256)))
+                    stage_coords.append(src_feat.new_zeros((0, 2)))
+                    continue
+                feat = src_feat[b_i, neg_flat_idx, :]
+                row = (neg_flat_idx // w).float()
+                col = (neg_flat_idx % w).float()
+                x = (col + 0.5) / w
+                y = (row + 0.5) / h
+                coords = torch.stack([x, y], dim=-1)
+                stage_feats.append(feat)
+                stage_coords.append(coords)
+            neg_features_per_stage.append(stage_feats)
+            neg_coords_per_stage.append(stage_coords)
+        
+        
 
-        for bs_index, (extra_small_score, small_score, medium_score, large_score, extra_small_indice, small_indice, medium_indice, large_indice) \
-                in enumerate(zip(extra_small_scores, small_scores, medium_scores, large_scores, extra_small_indices, small_indices, medium_indices, large_indices)):
+        for bs_index, (extra_small_score, small_score, medium_score, large_score,
+               extra_small_indice, small_indice, medium_indice, large_indice) \
+        in enumerate(zip(extra_small_scores, small_scores, medium_scores, large_scores,
+                          extra_small_indices_pos, small_indices_pos, medium_indices_pos, large_indices_pos)):
             total_score = extra_small_score + small_score + medium_score + large_score
             extra_small_num = int(max(self.max_added_num * extra_small_score / total_score , 1))
             small_num = int(max(self.max_added_num * small_score / total_score, 1))
@@ -207,7 +278,7 @@ class ExemplarSelector(nn.Module):
             selected_exemplars_features.append(stacked_features)
 
         exemplar_tokens = torch.stack(selected_exemplars_features, dim=0)
-        return exemplar_tokens
+        return exemplar_tokens, neg_features_per_stage, neg_coords_per_stage
 
 class GroundingDINO(nn.Module):
     """This is the Cross-Attention Detector module that performs object detection"""
@@ -589,7 +660,7 @@ class GroundingDINO(nn.Module):
                 poss.append(pos_l)
 
         label_dict = self.get_label_embeddingv2(label_list, samples.device)
-        exemplar_tokens = self.exemplar_selector(srcs, label_dict)
+        exemplar_tokens, neg_features_per_stage, neg_coords_per_stage = self.exemplar_selector(srcs, label_dict)
         text_dict = self.add_exemplar_tokens(tokenized, text_dict, exemplar_tokens, labels)
 
         input_query_bbox = input_query_label = attn_mask = dn_meta = None
@@ -618,6 +689,11 @@ class GroundingDINO(nn.Module):
         )
 
         out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
+        out['pos_exemplar_tokens'] = exemplar_tokens
+        out['neg_candidate_features'] = neg_features_per_stage
+        out['neg_candidate_coords'] = neg_coords_per_stage
+        out['label_encoded_text'] = label_dict['encoded_text']
+        out['label_text_mask'] = label_dict['text_token_mask']
         
 
         # Used to calculate losses
@@ -661,11 +737,10 @@ class GroundingDINO(nn.Module):
             for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
         ]
 
-
-
-
+    
+    
 class SetCriterion(nn.Module):
-    def __init__(self, matcher, weight_dict, focal_alpha,focal_gamma, losses):
+    def __init__(self, matcher, weight_dict, focal_alpha, focal_gamma, losses, contrast_temperature=0.07):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -678,23 +753,22 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.focal_alpha = focal_alpha
-        self.focal_gamma= focal_gamma
-
+        self.focal_gamma = focal_gamma
+        self.contrast_temperature = contrast_temperature
+ 
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
         """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
         """
-
         pred_logits = outputs['pred_logits']
         device = pred_logits.device
         tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
-        # Count the number of predictions that are NOT "no-object" (which is the last class)
         card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
         losses = {'cardinality_error': card_err}
         return losses
-
+ 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
@@ -704,200 +778,266 @@ class SetCriterion(nn.Module):
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs['pred_boxes'][idx]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-
+ 
         loss_bbox = F.l1_loss(src_boxes[:, :2], target_boxes[:, :2], reduction='none')
-
+ 
         losses = {}
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
-
+ 
         loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(src_boxes),
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
         losses['loss_giou'] = loss_giou.sum() / num_boxes
-
-        # calculate the x,y and h,w loss
+ 
         with torch.no_grad():
             losses['loss_xy'] = loss_bbox[..., :2].sum() / num_boxes
             losses['loss_hw'] = loss_bbox[..., 2:].sum() / num_boxes
-
-
+ 
         return losses
-
-
+ 
     def token_sigmoid_binary_focal_loss(self, outputs, targets, indices, num_boxes):
-        pred_logits=outputs['pred_logits']
-        new_targets=outputs['one_hot'].to(pred_logits.device)
-        text_mask=outputs['text_mask']
-
+        pred_logits = outputs['pred_logits']
+        new_targets = outputs['one_hot'].to(pred_logits.device)
+        text_mask = outputs['text_mask']
+ 
         assert (new_targets.dim() == 3)
         assert (pred_logits.dim() == 3)  # batch x from x to
-        
+ 
         bs, n, _ = pred_logits.shape
-        alpha=self.focal_alpha
-        gamma=self.focal_gamma
+        alpha = self.focal_alpha
+        gamma = self.focal_gamma
         if text_mask is not None:
-            # ODVG: each sample has different mask 
-            text_mask = text_mask.repeat(1, pred_logits.size(1)).view(outputs['text_mask'].shape[0],-1,outputs['text_mask'].shape[1])
+            text_mask = text_mask.repeat(1, pred_logits.size(1)).view(outputs['text_mask'].shape[0], -1, outputs['text_mask'].shape[1])
             pred_logits = torch.masked_select(pred_logits, text_mask)
             new_targets = torch.masked_select(new_targets, text_mask)
-
-        new_targets=new_targets.float()
+ 
+        new_targets = new_targets.float()
         p = torch.sigmoid(pred_logits)
         ce_loss = F.binary_cross_entropy_with_logits(pred_logits, new_targets, reduction="none")
         p_t = p * new_targets + (1 - p) * (1 - new_targets)
         loss = ce_loss * ((1 - p_t) ** gamma)
-
+ 
         if alpha >= 0:
             alpha_t = alpha * new_targets + (1 - alpha) * (1 - new_targets)
             loss = alpha_t * loss
-
-        total_num_pos=0
+ 
+        total_num_pos = 0
         for batch_indices in indices:
             total_num_pos += len(batch_indices[0])
-        num_pos_avg_per_gpu = max(total_num_pos , 1.0)
-        loss=loss.sum()/num_pos_avg_per_gpu
-        
+        num_pos_avg_per_gpu = max(total_num_pos, 1.0)
+        loss = loss.sum() / num_pos_avg_per_gpu
+ 
         losses = {'loss_ce': loss}
         return losses
-
-
+ 
     def _get_src_permutation_idx(self, indices):
-        # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
-
+ 
     def _get_tgt_permutation_idx(self, indices):
-        # permute targets following indices
         batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
-
+ 
+    # ---- Stage 4: contrastive loss 관련 메서드 (새로 추가된 부분) ----
+    @staticmethod
+    def _get_text_anchor(outputs):
+        """텍스트 임베딩을 마스킹해서 평균 -> [bs, 256] anchor 벡터."""
+        enc = outputs['label_encoded_text']
+        mask = outputs['label_text_mask'].float()
+        summed = (enc * mask.unsqueeze(-1)).sum(dim=1)
+        denom = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return summed / denom
+ 
+    @staticmethod
+    def _filter_gt_overlap(coords, gt_boxes_xyxy):
+        """
+        coords: [n, 2] (x, y), 0~1 정규화
+        gt_boxes_xyxy: [n_obj, 4] (x0, y0, x1, y1), 0~1 정규화
+        -> GT box 중 하나라도 겹치면 True인 mask 리턴 (겹치는 건 나중에 제외할 대상)
+        """
+        if coords.numel() == 0 or gt_boxes_xyxy.numel() == 0:
+            return torch.zeros(coords.shape[0], dtype=torch.bool, device=coords.device)
+        x = coords[:, 0].unsqueeze(1)
+        y = coords[:, 1].unsqueeze(1)
+        x0, y0, x1, y1 = gt_boxes_xyxy[:, 0], gt_boxes_xyxy[:, 1], gt_boxes_xyxy[:, 2], gt_boxes_xyxy[:, 3]
+        inside = (x >= x0.unsqueeze(0)) & (x <= x1.unsqueeze(0)) & \
+                 (y >= y0.unsqueeze(0)) & (y <= y1.unsqueeze(0))
+        return inside.any(dim=1)
+ 
+    def loss_contrast_exemplar(self, outputs, targets, indices, num_boxes):
+        """Stage 3 (GT val) + Stage 4 (InfoNCE contrastive loss)"""
+        device = outputs['pos_exemplar_tokens'].device
+        bs, n_stage, dim = outputs['pos_exemplar_tokens'].shape
+        text_anchor = self._get_text_anchor(outputs)
+        tau = self.contrast_temperature
+ 
+        total_loss = 0.0
+        n_terms = 0
+ 
+        for b in range(bs):
+            gt_boxes_xyxy = box_ops.box_cxcywh_to_xyxy(targets[b]['boxes']) if len(targets[b]['boxes']) > 0 \
+                else torch.zeros((0, 4), device=device)
+ 
+            for stage_i in range(n_stage):
+                anchor = text_anchor[b]
+                pos = outputs['pos_exemplar_tokens'][b, stage_i]
+ 
+                neg_feats = outputs['neg_candidate_features'][stage_i][b]
+                neg_coords = outputs['neg_candidate_coords'][stage_i][b]
+                overlaps_gt = self._filter_gt_overlap(neg_coords, gt_boxes_xyxy)
+                verified_hard_negs = neg_feats[~overlaps_gt]
+ 
+                other_idx = [i for i in range(bs) if i != b]
+                if len(other_idx) > 0:
+                    easy_negs = outputs['pos_exemplar_tokens'][other_idx, stage_i, :]
+                else:
+                    easy_negs = pos.new_zeros((0, dim))
+ 
+                all_negs = torch.cat([verified_hard_negs, easy_negs], dim=0)
+                if all_negs.shape[0] == 0:
+                    continue
+ 
+                sim_pos = F.cosine_similarity(anchor.unsqueeze(0), pos.unsqueeze(0), dim=-1) / tau
+                sim_negs = F.cosine_similarity(anchor.unsqueeze(0), all_negs, dim=-1) / tau
+ 
+                logits = torch.cat([sim_pos, sim_negs], dim=0)
+                labels_ = torch.zeros(1, dtype=torch.long, device=device)
+                loss = F.cross_entropy(logits.unsqueeze(0), labels_)
+ 
+                total_loss = total_loss + loss
+                n_terms += 1
+ 
+        if n_terms == 0:
+            contrast_loss = outputs['pos_exemplar_tokens'].sum() * 0.0
+        else:
+            contrast_loss = total_loss / n_terms
+ 
+        return {'loss_contrast_exemplar': contrast_loss}
+    # ---- Stage 4 끝 ----
+ 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'labels': self.token_sigmoid_binary_focal_loss,
             'cardinality': self.loss_cardinality,
-            'boxes': self.loss_boxes
+            'boxes': self.loss_boxes,
+            'contrast_exemplar': self.loss_contrast_exemplar,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
-
+ 
     def forward(self, outputs, targets, cat_list, caption, return_indices=False):
         """ This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
-            
              return_indices: used for vis. if True, the layer0-5 indices will be returned as well.
         """
-        device=next(iter(outputs.values())).device
-        one_hot = torch.zeros(outputs['pred_logits'].size(),dtype=torch.int64) # torch.Size([bs, 900, 256])
-        token = outputs['token'] 
-        
+        device = next(iter(outputs.values())).device
+        one_hot = torch.zeros(outputs['pred_logits'].size(), dtype=torch.int64)
+        token = outputs['token']
+ 
         label_map_list = []
         indices = []
-        for j in range(len(cat_list)): # bs
-            label_map=[]
+        for j in range(len(cat_list)):
+            label_map = []
             for i in range(len(cat_list[j])):
-                label_id=torch.tensor([i])
+                label_id = torch.tensor([i])
                 per_label = create_positive_map(token[j], label_id, cat_list[j], caption[j], outputs['max_text_len'])
                 label_map.append(per_label)
-            label_map=torch.stack(label_map,dim=0).squeeze(1)
+            label_map = torch.stack(label_map, dim=0).squeeze(1)
             label_map_list.append(label_map)
-        for j in range(len(cat_list)): # bs
+        for j in range(len(cat_list)):
             for_match = {
-                "pred_logits" : outputs['pred_logits'][j].unsqueeze(0),
-                "pred_boxes" : outputs['pred_boxes'][j].unsqueeze(0)
+                "pred_logits": outputs['pred_logits'][j].unsqueeze(0),
+                "pred_boxes": outputs['pred_boxes'][j].unsqueeze(0)
             }
             inds = self.matcher(for_match, [targets[j]], label_map_list[j])
             indices.extend(inds)
-        # indices : A list of size batch_size, containing tuples of (index_i, index_j) where:
-        # - index_i is the indices of the selected predictions (in order)
-        # - index_j is the indices of the corresponding selected targets (in order)
-
-        # import pdb; pdb.set_trace()
+ 
         tgt_ids = [v["labels"].cpu() for v in targets]
-        # len(tgt_ids) == bs
         for i in range(len(indices)):
-            tgt_ids[i]=tgt_ids[i][indices[i][1]]
-            one_hot[i,indices[i][0]] = label_map_list[i][tgt_ids[i]].to(torch.long)
+            tgt_ids[i] = tgt_ids[i][indices[i][1]]
+            one_hot[i, indices[i][0]] = label_map_list[i][tgt_ids[i]].to(torch.long)
         outputs['one_hot'] = one_hot
         if return_indices:
             indices0_copy = indices
             indices_list = []
-
-        # Compute the average number of target boxes accross all nodes, for normalization purposes
+ 
         num_boxes_list = [len(t["labels"]) for t in targets]
         num_boxes = sum(num_boxes_list)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
-
-        # Compute all the requested losses
+ 
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
-
-        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
+ 
         if 'aux_outputs' in outputs:
             for idx, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices = []
-                for j in range(len(cat_list)): # bs
+                for j in range(len(cat_list)):
                     aux_output_single = {
-                        'pred_logits' : aux_outputs['pred_logits'][j].unsqueeze(0),
+                        'pred_logits': aux_outputs['pred_logits'][j].unsqueeze(0),
                         'pred_boxes': aux_outputs['pred_boxes'][j].unsqueeze(0)
                     }
                     inds = self.matcher(aux_output_single, [targets[j]], label_map_list[j])
                     indices.extend(inds)
-                one_hot_aux = torch.zeros(outputs['pred_logits'].size(),dtype=torch.int64)
+                one_hot_aux = torch.zeros(outputs['pred_logits'].size(), dtype=torch.int64)
                 tgt_ids = [v["labels"].cpu() for v in targets]
                 for i in range(len(indices)):
-                    tgt_ids[i]=tgt_ids[i][indices[i][1]]
-                    one_hot_aux[i,indices[i][0]] = label_map_list[i][tgt_ids[i]].to(torch.long)
+                    tgt_ids[i] = tgt_ids[i][indices[i][1]]
+                    one_hot_aux[i, indices[i][0]] = label_map_list[i][tgt_ids[i]].to(torch.long)
                 aux_outputs['one_hot'] = one_hot_aux
                 aux_outputs['text_mask'] = outputs['text_mask']
                 if return_indices:
                     indices_list.append(indices)
                 for loss in self.losses:
+                    if loss == 'contrast_exemplar':
+                        continue
                     kwargs = {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
                     l_dict = {k + f'_{idx}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
-
-        # interm_outputs loss
+ 
         if 'interm_outputs' in outputs:
             interm_outputs = outputs['interm_outputs']
             indices = []
-            for j in range(len(cat_list)): # bs
+            for j in range(len(cat_list)):
                 interm_output_single = {
-                    'pred_logits' : interm_outputs['pred_logits'][j].unsqueeze(0),
+                    'pred_logits': interm_outputs['pred_logits'][j].unsqueeze(0),
                     'pred_boxes': interm_outputs['pred_boxes'][j].unsqueeze(0)
                 }
                 inds = self.matcher(interm_output_single, [targets[j]], label_map_list[j])
                 indices.extend(inds)
-            one_hot_aux = torch.zeros(outputs['pred_logits'].size(),dtype=torch.int64)
+            one_hot_aux = torch.zeros(outputs['pred_logits'].size(), dtype=torch.int64)
             tgt_ids = [v["labels"].cpu() for v in targets]
             for i in range(len(indices)):
-                tgt_ids[i]=tgt_ids[i][indices[i][1]]
-                one_hot_aux[i,indices[i][0]] = label_map_list[i][tgt_ids[i]].to(torch.long)
+                tgt_ids[i] = tgt_ids[i][indices[i][1]]
+                one_hot_aux[i, indices[i][0]] = label_map_list[i][tgt_ids[i]].to(torch.long)
             interm_outputs['one_hot'] = one_hot_aux
             interm_outputs['text_mask'] = outputs['text_mask']
             if return_indices:
                 indices_list.append(indices)
             for loss in self.losses:
+                if loss == 'contrast_exemplar':
+                    continue
                 kwargs = {}
                 l_dict = self.get_loss(loss, interm_outputs, targets, indices, num_boxes, **kwargs)
                 l_dict = {k + f'_interm': v for k, v in l_dict.items()}
                 losses.update(l_dict)
-
+ 
         if return_indices:
             indices_list.append(indices0_copy)
             return losses, indices_list
-
-
+ 
         return losses
+
+
 
 
 class PostProcess(nn.Module):
@@ -993,6 +1133,7 @@ def build_groundingdino(args):
     dn_labelbook_size = args.dn_labelbook_size
     dec_pred_bbox_embed_share = args.dec_pred_bbox_embed_share
     sub_sentence_present = args.sub_sentence_present
+    
 
     model = GroundingDINO(
         backbone,
@@ -1024,6 +1165,7 @@ def build_groundingdino(args):
     # prepare weight dict
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict['loss_contrast_exemplar'] = getattr(args, 'contrast_loss_coef', 0.1)   
     clean_weight_dict_wo_dn = copy.deepcopy(weight_dict)
 
     
@@ -1052,15 +1194,17 @@ def build_groundingdino(args):
             interm_loss_coef = args.interm_loss_coef
         except:
             interm_loss_coef = 1.0
-        interm_weight_dict.update({k + f'_interm': v * interm_loss_coef * _coeff_weight_dict[k] for k, v in clean_weight_dict_wo_dn.items()})
+        interm_weight_dict.update({k + f'_interm': v * interm_loss_coef * _coeff_weight_dict[k] for k, v in clean_weight_dict_wo_dn.items() if k in _coeff_weight_dict})
         weight_dict.update(interm_weight_dict)
 
     # losses = ['labels', 'boxes', 'cardinality']
-    losses = ['labels', 'boxes']
+    losses = ['labels', 'boxes', 'contrast_exemplar']   # 'contrast_exemplar' added
 
-    criterion = SetCriterion(matcher=matcher, weight_dict=weight_dict,
-                             focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,losses=losses
-                             )
+    criterion = SetCriterion(
+    matcher=matcher, weight_dict=weight_dict,
+    focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma, losses=losses,
+    contrast_temperature=getattr(args, 'contrast_temperature', 0.07),   # 
+)
     criterion.to(device)
     postprocessors = {'bbox': PostProcess(num_select=args.num_select  , text_encoder_type=args.text_encoder_type,nms_iou_threshold=args.nms_iou_threshold,args=args)}
 
