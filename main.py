@@ -14,6 +14,9 @@ from torch.utils.data import DataLoader, DistributedSampler, RandomSampler
 import warnings
 warnings.simplefilter("ignore")
 
+import wandb  
+
+
 from util.get_param_dicts import get_param_dict
 from util.logger import setup_logger
 from util.slconfig import DictAction, SLConfig
@@ -61,6 +64,8 @@ def get_args_parser():
     parser.add_argument('--find_unused_params', action='store_true')
     parser.add_argument('--save_results', action='store_true')
     parser.add_argument('--save_log', action='store_true')
+    parser.add_argument('--use_wandb', action='store_true')  
+    parser.add_argument('--wandb_project', default='countse-ablation', type=str)
 
     # distributed training parameters
     parser.add_argument('--world_size', default=8, type=int,
@@ -273,6 +278,13 @@ def main(args):
     
  
     
+    if getattr(args, 'use_wandb', False) and utils.is_main_process(): 
+        wandb.init(                                                     # 
+            project=args.wandb_project,                                  
+            name=os.path.basename(args.output_dir.rstrip('/')),          
+            config=vars(args),                                           
+        )                                                                 
+
     print("Start training")
     start_time = time.time()
     best_map_holder = BestMetricHolder(init_res=100.0, better='small', use_ema=False)
@@ -332,6 +344,8 @@ def main(args):
             **{f'train_{k}': v for k, v in train_stats.items()},
             **{f'test_{k}': v for k, v in test_stats.items()},
         }
+        if getattr(args, 'use_wandb', False) and utils.is_main_process():   # 
+            wandb.log({**log_stats, 'val_mae': val_mae, 'epoch': epoch}) 
 
 
         try:
@@ -360,6 +374,8 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    if getattr(args, 'use_wandb', False) and utils.is_main_process():   # 
+        wandb.finish()   
 
     # remove the copied files.
     copyfilelist = vars(args).get('copyfilelist')

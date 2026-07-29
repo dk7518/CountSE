@@ -2,3 +2,12 @@ checkpoints/
 *.pth
 data/
 *_ckpt*/
+
+ckpt_*/
+
+wandb/
+
+*.pth
+
+results/
+
