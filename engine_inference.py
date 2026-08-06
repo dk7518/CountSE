@@ -402,9 +402,11 @@ def get_count_errs(
 
         gt_count = targets[sample_ind]["labels_uncropped"].shape[0]
         pred_cnt = sample_logits.shape[0]
+        crop_was_triggered = False
         # Predicted max # of objects.
         if args.crop and pred_cnt == args.num_select:
             # If crop image do not apply TT-Norm as double counting may occur on crop boundaries for a few (but not all) samples. In other words, cropping may (incorrectly) cause higher counts around boundaries, which may lead to false detection of self-similarity if TT-Norm is applied. Solution for now is to just disable TT-Norm when apply cropping.
+            crop_was_triggered = True
             print("Detected high number of objects, cropping...")
 
             # Crop image.
@@ -853,6 +855,16 @@ def get_count_errs(
         print("Pred Count: " + str(pred_cnt) + ", GT Count: " + str(gt_count))
 
         abs_errs.append(np.abs(gt_count - pred_cnt))
+        
+        image_id = targets[sample_ind]["image_id"].item()
+        log_path = os.path.join(args.output_dir, "per_image_errors.csv")
+        write_header = not os.path.exists(log_path)
+        with open(log_path, "a") as f:
+            if write_header:
+                f.write("image_id,gt_count,pred_cnt,abs_error,crop_triggered\n")
+            f.write(f"{image_id},{gt_count},{pred_cnt},{abs(gt_count - pred_cnt)},{int(crop_was_triggered)}\n")
+            
+            
     err_percent = np.abs(gt_count - pred_cnt) / gt_count
     targets[0]['err_percent'] = err_percent
     print("Current error percent: ", err_percent)

@@ -68,11 +68,13 @@ from groundingdino.util.visualizer import renorm
 
 
 class ExemplarAdapter(nn.Module):
-    def __init__(self, dim=256, hidden_dim=256):
+    def __init__(self, dim=256, hidden_dim=256, #dropout=0.1
+                 ):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             nn.ReLU(inplace=True),
+            #nn.Dropout(dropout),
             nn.Linear(hidden_dim, dim),
         )
         nn.init.zeros_(self.net[-1].weight)
