@@ -397,6 +397,16 @@ def get_count_errs(
         )
         sample_logits = sample_logits[text_mask, :]
         sample_boxes = sample_boxes[text_mask, :]
+        
+        # --- debug: save boxes for image 6003 ---
+        image_id_debug = targets[sample_ind]["image_id"].item()
+        if image_id_debug == 6003:
+            import json
+            debug_boxes = sample_boxes.detach().cpu().numpy().tolist()
+            with open(os.path.join(args.output_dir, "debug_boxes_6003.json"), "w") as f:
+                json.dump(debug_boxes, f)
+            print(f"[DEBUG] saved {len(debug_boxes)} boxes for image_id 6003")
+            # --- end debug ---        
 
         targets[0]['sample_boxes'] = sample_boxes
 
@@ -833,6 +843,8 @@ def get_count_errs(
                 ) == (end_idx - 1)
                 sample_logits_cropped = sample_logits_cropped[text_mask, :]
                 sample_boxes_cropped = sample_boxes_cropped[text_mask, :]
+                
+                
 
                 pred_cnt += sample_logits_cropped.shape[0]
 

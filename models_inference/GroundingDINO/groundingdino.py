@@ -68,7 +68,11 @@ from groundingdino.util.visualizer import renorm
 
 
 class ExemplarAdapter(nn.Module):
-    def __init__(self, dim=256, hidden_dim=256, #dropout=0.1
+    """
+    on Frozen Swin feature - lightweight training projection. Residual + zero-init.
+    """
+ 
+    def __init__(self, dim=256, hidden_dim=256, max_residual_ratio=0.2,  # dropout=0.1
                  ):
         super().__init__()
         self.net = nn.Sequential(
@@ -79,9 +83,17 @@ class ExemplarAdapter(nn.Module):
         )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+        self.max_residual_ratio = max_residual_ratio
 
     def forward(self, x):
-        return x + self.net(x)
+        residual = self.net(x)
+        x_norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        residual_norm = residual.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        max_norm = self.max_residual_ratio * x_norm
+        scale = (max_norm / residual_norm).clamp(max=1.0)
+        residual = residual * scale
+        return x + residual
+#        return x + self.net(x)history | grep main.py
 
 
 class ExemplarSelector(nn.Module):

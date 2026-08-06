@@ -60,25 +60,71 @@ from .utils import MLP, ContrastiveEmbed, sigmoid_focal_loss
 
 from .matcher import build_matcher
 
+from torchvision.ops import roi_align
+
+class TeacherExemplarEncoder(nn.Module):
+    """
+    Privileged-information teacher: uses human-annotated GT exemplar boxes
+    (training-time only) to produce a reference exemplar embedding via RoIAlign.
+    """
+    def __init__(self, in_dim=256, out_dim=256, roi_size=7):
+        super().__init__()
+        self.roi_size = roi_size
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim * roi_size * roi_size, out_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def forward(self, feature_map, gt_boxes_xyxy, spatial_scale):
+        rois = []
+        for b, boxes in enumerate(gt_boxes_xyxy):
+            if boxes.numel() == 0:
+                continue
+            batch_idx = torch.full((boxes.shape[0], 1), b, device=boxes.device, dtype=boxes.dtype)
+            rois.append(torch.cat([batch_idx, boxes], dim=1))
+        if len(rois) == 0:
+            return None
+        rois = torch.cat(rois, dim=0)
+        pooled = roi_align(feature_map, rois, output_size=self.roi_size, spatial_scale=spatial_scale, aligned=True)
+        pooled = pooled.flatten(1)
+        return self.proj(pooled)
+
+
+def distillation_loss(student_emb, teacher_emb):
+    if teacher_emb is None or student_emb is None or student_emb.shape[0] != teacher_emb.shape[0]:
+        return None
+    student_emb = F.normalize(student_emb, dim=-1)
+    teacher_emb = F.normalize(teacher_emb, dim=-1)
+    return (1 - (student_emb * teacher_emb).sum(dim=-1)).mean()
 
 class ExemplarAdapter(nn.Module):
     """
     on Frozen Swin feature - lightweight training projection. Residual + zero-init.
     """
  
-    def __init__(self, dim=256, hidden_dim=256, dropout=0.1):
+    def __init__(self, dim=256, hidden_dim=256, max_residual_ratio=0.2,  # dropout=0.1
+                 ):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
+            #nn.Dropout(dropout),
             nn.Linear(hidden_dim, dim),
         )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+        self.max_residual_ratio = max_residual_ratio
 
     def forward(self, x):
-        return x + self.net(x)
+        residual = self.net(x)
+        x_norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        residual_norm = residual.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        max_norm = self.max_residual_ratio * x_norm
+        scale = (max_norm / residual_norm).clamp(max=1.0)
+        residual = residual * scale
+        return x + residual
+#        return x + self.net(x)
     
 class ExemplarSelector(nn.Module):
     def __init__(self, max_added_num=8, egv=0.1, topk_num=20):
@@ -318,6 +364,8 @@ class GroundingDINO(nn.Module):
         """
         super().__init__()
         self.exemplar_selector = ExemplarSelector(max_added_num=18, topk_num=15)
+        self.use_distill = False 
+        self.teacher_encoder = None
         self.num_queries = num_queries
         self.transformer = transformer
         self.hidden_dim = hidden_dim = transformer.d_model
@@ -576,10 +624,12 @@ class GroundingDINO(nn.Module):
                             dictionnaries containing the two above keys for each decoder layer.
         """
         
-        if targets is None:
+        if "captions" in kw and kw["captions"] is not None:
             captions = kw["captions"]
-        else:
+        elif targets is not None:
             captions = [t["caption"] for t in targets]
+        else:
+            captions = kw["captions"]
         # encoder texts
 
         tokenized = self.tokenizer(captions, padding="longest", return_tensors="pt").to(
@@ -662,6 +712,44 @@ class GroundingDINO(nn.Module):
 
         label_dict = self.get_label_embeddingv2(label_list, samples.device)
         exemplar_tokens, neg_features_per_stage, neg_coords_per_stage = self.exemplar_selector(srcs, label_dict)
+        
+        ####distillation
+        distill_loss = None
+        if getattr(self, 'use_distill', False) and self.teacher_encoder is not None and targets is not None:
+            img_h, img_w = samples.tensors.shape[-2:]
+            gt_boxes_xyxy_per_image = []
+            for t in targets:
+                boxes = t.get("exemplars", None)
+                if boxes is None or boxes.numel() == 0:
+                    gt_boxes_xyxy_per_image.append(torch.zeros((0, 4), device=samples.tensors.device))
+                    continue
+                cx, cy, bw, bh = boxes.unbind(-1)
+                x1 = (cx - bw / 2) * img_w
+                y1 = (cy - bh / 2) * img_h
+                x2 = (cx + bw / 2) * img_w
+                y2 = (cy + bh / 2) * img_h
+                gt_boxes_xyxy_per_image.append(torch.stack([x1, y1, x2, y2], dim=-1))
+
+            feat_h, feat_w = srcs[0].shape[-2:]
+            spatial_scale = feat_h / img_h
+            teacher_emb = self.teacher_encoder(srcs[0], gt_boxes_xyxy_per_image, spatial_scale)
+
+            if teacher_emb is not None:
+                counts = [b.shape[0] for b in gt_boxes_xyxy_per_image]
+                if sum(counts) > 0:
+                    student_per_img = exemplar_tokens.mean(dim=1)  # [bs, 256]
+                    teacher_per_img, idx = [], 0
+                    for c in counts:
+                        teacher_per_img.append(teacher_emb[idx:idx+c].mean(dim=0) if c > 0 else student_per_img.new_zeros(256))
+                        idx += c
+                    teacher_per_img = torch.stack(teacher_per_img, dim=0)
+                    valid_mask = torch.tensor([c > 0 for c in counts], device=student_per_img.device)
+                    if valid_mask.any():
+                        distill_loss = distillation_loss(student_per_img[valid_mask], teacher_per_img[valid_mask])
+                        if not hasattr(self, '_distill_debug_printed'):
+                            print(f"[DISTILL DEBUG] loss={distill_loss.item():.4f}, box counts={counts}")
+                            self._distill_debug_printed = True
+                            ######
         text_dict = self.add_exemplar_tokens(tokenized, text_dict, exemplar_tokens, labels)
 
         input_query_bbox = input_query_label = attn_mask = dn_meta = None
@@ -690,6 +778,7 @@ class GroundingDINO(nn.Module):
         )
 
         out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
+        out['distill_loss'] = distill_loss
         out['pos_exemplar_tokens'] = exemplar_tokens
         out['neg_candidate_features'] = neg_features_per_stage
         out['neg_candidate_coords'] = neg_coords_per_stage
@@ -977,6 +1066,9 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+
+        if outputs.get('distill_loss', None) is not None:
+            losses['loss_distill'] = outputs['distill_loss']
  
         if 'aux_outputs' in outputs:
             for idx, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -1158,6 +1250,10 @@ def build_groundingdino(args):
         sub_sentence_present=sub_sentence_present,
         max_text_len=args.max_text_len,
     )
+    
+    model.use_distill = getattr(args, 'use_distill', False)
+    if model.use_distill:
+        model.teacher_encoder = TeacherExemplarEncoder(in_dim=256, out_dim=256, roi_size=7).to(device)
 
 
 
@@ -1167,6 +1263,7 @@ def build_groundingdino(args):
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
     weight_dict['loss_contrast_exemplar'] = getattr(args, 'contrast_loss_coef', 0.1)   
+    weight_dict['loss_distill'] = getattr(args, 'distill_loss_coef', 1.0)
     clean_weight_dict_wo_dn = copy.deepcopy(weight_dict)
 
     
