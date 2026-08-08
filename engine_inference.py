@@ -10,6 +10,7 @@ import numpy as np
 import math
 import os
 import sys
+import json
 import io
 import contextlib
 from typing import Iterable
@@ -398,15 +399,21 @@ def get_count_errs(
         sample_logits = sample_logits[text_mask, :]
         sample_boxes = sample_boxes[text_mask, :]
         
-        # --- debug: save boxes for image 6003 ---
-        image_id_debug = targets[sample_ind]["image_id"].item()
-        if image_id_debug == 6003:
+        # --- 논문 figure용 box 덤프 (모든 target image_id에 대해) ---
+        TARGET_DEBUG_IMAGE_IDS = {
+            879, 2021, 2075, 5597, 1543,      # val 개선
+            732, 740, 2031, 2024, 657,        # val 악화
+            5779, 3829, 800, 5511, 1094,      # test 개선
+            6003, 781, 5513, 918, 939,        # test 악화
+        }
+        _cur_image_id = targets[sample_ind]["image_id"].item()
+        if _cur_image_id in TARGET_DEBUG_IMAGE_IDS:
             import json
-            debug_boxes = sample_boxes.detach().cpu().numpy().tolist()
-            with open(os.path.join(args.output_dir, "debug_boxes_6003.json"), "w") as f:
-                json.dump(debug_boxes, f)
-            print(f"[DEBUG] saved {len(debug_boxes)} boxes for image_id 6003")
-            # --- end debug ---        
+            _debug_boxes = sample_boxes.detach().cpu().numpy().tolist()
+            with open(os.path.join(args.output_dir, f"debug_boxes_{_cur_image_id}.json"), "w") as f:
+                json.dump(_debug_boxes, f)
+            print(f"[DEBUG] saved {len(_debug_boxes)} boxes for image_id {_cur_image_id}")
+        # --- 여기까지 ---
 
         targets[0]['sample_boxes'] = sample_boxes
 

@@ -77,6 +77,7 @@ def get_args_parser():
     parser.add_argument("--local-rank", type=int, help='local rank for DistributedDataParallel')
     parser.add_argument('--amp', action='store_true',
                         help="Train with mixed precision")
+    parser.add_argument('--norm_clip_alpha', type=float, default=0.2)
     return parser
 
 
@@ -152,6 +153,10 @@ def main(args):
     wo_class_error = False
     model.to(device)
     logger.debug("build model, done.")
+    
+    # main.py 등에서 모델 빌드 직후, 학습 시작 전에 한 줄 추가
+    print("norm_clip_alpha:", args.norm_clip_alpha, 
+      "-> adapter.max_residual_ratio:", model.exemplar_selector.adapter.max_residual_ratio)
 
 
     model_without_ddp = model

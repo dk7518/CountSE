@@ -137,6 +137,8 @@ def get_args_parser():
         "--local-rank", type=int, help="local rank for DistributedDataParallel"
     )
     parser.add_argument("--amp", action="store_true", help="Train with mixed precision")
+    parser.add_argument('--norm_clip_alpha', type=float, default=0.2)
+
     return parser
 
 

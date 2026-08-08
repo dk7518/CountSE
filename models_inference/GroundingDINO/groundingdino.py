@@ -72,7 +72,7 @@ class ExemplarAdapter(nn.Module):
     on Frozen Swin feature - lightweight training projection. Residual + zero-init.
     """
  
-    def __init__(self, dim=256, hidden_dim=256, max_residual_ratio=0.2,  # dropout=0.1
+    def __init__(self, dim=256, hidden_dim=256, max_residual_ratio=0.2, alpha=0.2, eps=1e-6 # dropout=0.1
                  ):
         super().__init__()
         self.net = nn.Sequential(
@@ -84,6 +84,8 @@ class ExemplarAdapter(nn.Module):
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
         self.max_residual_ratio = max_residual_ratio
+        self.alpha = alpha
+        self.eps = eps
 
     def forward(self, x):
         residual = self.net(x)
@@ -97,14 +99,14 @@ class ExemplarAdapter(nn.Module):
 
 
 class ExemplarSelector(nn.Module):
-    def __init__(self, max_added_num=8, egv=0.1, topk_num=20):
+    def __init__(self, max_added_num=8, egv=0.1, topk_num=20, max_residual_ratio=0.2,):
         super().__init__()
         self.max_added_num = max_added_num
         self.enc_out_class_embed = ContrastiveEmbed()
         self.cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
         self.egv = egv
         self.topk = topk_num
-        self.adapter = ExemplarAdapter(dim=256, hidden_dim=256)
+        self.adapter = ExemplarAdapter(dim=256, hidden_dim=256, max_residual_ratio=max_residual_ratio)
 
     def eigenDecomposition(self, A):
         threshold = self.egv
@@ -238,6 +240,7 @@ class GroundingDINO(nn.Module):
         sub_sentence_present=True,
         max_text_len=256,
         carpk=False,
+        norm_clip_alpha=0.2
     ):
         """Initializes the model.
         Parameters:
@@ -249,7 +252,7 @@ class GroundingDINO(nn.Module):
         """
         super().__init__()
         
-        self.exemplar_selector = ExemplarSelector(max_added_num=18, topk_num=15)
+        self.exemplar_selector = ExemplarSelector(max_added_num=18, topk_num=15, max_residual_ratio=norm_clip_alpha)
         self.num_queries = num_queries
         self.transformer = transformer
         self.hidden_dim = hidden_dim = transformer.d_model
